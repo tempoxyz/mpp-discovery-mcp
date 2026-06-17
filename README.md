@@ -42,17 +42,23 @@ authoritative.
 
 ## Tools
 
-All tool responses include `structuredContent` plus a text summary.
+All tool responses include `structuredContent`, an `outputSchema`, and a text
+summary. Discovery is advisory; the runtime `402 Challenge` from the target
+paid API remains authoritative.
 
-- `list_services()` -> `id`, `name`, `url`, `categories`, `integration`,
-  `status`, `description`
-- `search_services(query?, category?, method?, integration?, status?)` ->
-  substring search over name, description, and tags plus exact filters
+- `list_services(limit?, offset?)` -> paginated `id`, `name`, `url`,
+  `categories`, `integration`, `status`, `description`; default `limit` is 50
+  and max is 200
+- `search_services(query?, category?, method?, integration?, status?, limit?,
+  offset?)` -> paginated substring search over name, description, and tags plus
+  exact filters; `category`, `integration`, and `status` are validated against
+  the registry enums and invalid values return an MCP tool error
 - `get_service(id_or_name)` -> full `Service`
 - `get_offers(service, route?)` -> endpoint payment offers from
   `endpoints[].payment`
-- `get_openapi(service)` -> live fetches `service.docs.openapi` when present,
-  otherwise returns a registry-derived endpoint view
+- `get_openapi(service)` -> first successful result from `service.docs.openapi`,
+  `${service.url}/openapi.json`, `service.docs.apiReference`, or a
+  registry-derived endpoint view; fetch failures fall back gracefully
 
 ## MCP client config
 
