@@ -56,9 +56,17 @@ paid API remains authoritative.
 - `get_service(id_or_name)` -> full `Service`
 - `get_offers(service, route?)` -> endpoint payment offers from
   `endpoints[].payment`
-- `get_openapi(service)` -> first successful result from `service.docs.openapi`,
-  `${service.url}/openapi.json`, `service.docs.apiReference`, or a
-  registry-derived endpoint view; fetch failures fall back gracefully
+- `get_openapi(service, raw?)` -> validated OpenAPI data from
+  `service.docs.openapi`, `${service.url}/openapi.json`,
+  `service.docs.apiReference`, or a registry-derived endpoint view. Fetched
+  candidates must use HTTPS, return HTTP 200 JSON, and be OpenAPI-shaped
+  (`openapi` string or `paths` object); HTML, non-OpenAPI JSON, redirects beyond
+  3 hops, oversized fetches, and network failures fall back gracefully. The
+  default response is a summary with `openapiVersion`, `info.title/version`,
+  `x-service-info`, and `paths[]` entries containing `method`, `path`,
+  `summary`, and payment offers from `x-payment-info`. Set `raw: true` to
+  request the full fetched document when it is under the 256 KiB raw response
+  cap; larger raw requests return the summary plus a note and source URL.
 
 ## MCP client config
 
