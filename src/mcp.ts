@@ -16,6 +16,19 @@ const ADVISORY =
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 200
 const OPENAPI_FETCH_TIMEOUT_MS = 3000
+const MAX_OPENAPI_RAW_BYTES = 256 * 1024
+const MAX_OPENAPI_FETCH_BYTES = 1024 * 1024
+const MAX_OPENAPI_REDIRECTS = 3
+const HTTP_METHODS = [
+	"get",
+	"put",
+	"post",
+	"delete",
+	"patch",
+	"head",
+	"options",
+	"trace",
+] as const
 
 const INITIALIZE_INSTRUCTIONS = [
 	"Use this read-only MCP server to discover MPP paid API services and payment terms from https://mpp.dev/api/services.",
@@ -52,6 +65,26 @@ type OpenApiSource = "docs.openapi" | "well-known" | "apiReference" | "registry"
 type OpenApiCandidate = {
 	source: Exclude<OpenApiSource, "registry">
 	url: string
+}
+
+type OpenApiRequestOptions = {
+	raw: boolean
+}
+
+type JsonObject = Record<string, unknown>
+
+type OpenApiDocument = JsonObject & {
+	openapi?: unknown
+	info?: unknown
+	paths?: unknown
+}
+
+type FetchedOpenApi = {
+	source: Exclude<OpenApiSource, "registry">
+	url: string
+	contentType: string
+	bytes: number
+	document: OpenApiDocument
 }
 
 export async function handleMcp(
@@ -188,7 +221,6 @@ async function handleToolCall(
 				{
 					...meta,
 					appliedFilters: {},
-					count: services.length,
 					total: services.length,
 					returned: page.length,
 					offset: pagination.offset,
@@ -208,15 +240,13 @@ async function handleToolCall(
 				{
 					...meta,
 					appliedFilters: filters,
-					filters,
-					count: services.length,
 					total: services.length,
 					returned: page.length,
 					offset: pagination.offset,
 					limit: pagination.limit,
 					services: page,
 				},
-				`Matched ${services.length} MPP services; returned ${page.length}. ${ADVISORY}`,
+				`Returned ${page.length} of ${services.length} MPP services. ${ADVISORY}`,
 			)
 		}
 
@@ -255,15 +285,16 @@ async function handleToolCall(
 
 		if (name === "get_openapi") {
 			const serviceName = requiredString(args, "service")
+			const raw = booleanArg(args, "raw", false)
 			const service = requireService(
 				catalog.services,
 				serviceName,
 			)
-			const openapi = await openApiFor(service)
+			const openapi = await openApiFor(service, { raw })
 			return toolResult(
 				{
 					...meta,
-					appliedFilters: { service: serviceName },
+					appliedFilters: { service: serviceName, ...(raw ? { raw } : {}) },
 					service: serviceRef(service),
 					count: 1,
 					source: openapi.source,
@@ -279,9 +310,9 @@ async function handleToolCall(
 	}
 }
 
-async function openApiFor(service: Service) {
+async function openApiFor(service: Service, options: OpenApiRequestOptions) {
 	for (const candidate of openApiCandidates(service)) {
-		const fetched = await fetchOpenApiCandidate(candidate)
+		const fetched = await fetchOpenApiCandidate(candidate, options)
 		if (fetched) return fetched
 	}
 
@@ -304,30 +335,231 @@ function openApiConventionUrl(serviceUrl: string): string {
 	return `${serviceUrl.replace(/\/+$/, "")}/openapi.json`
 }
 
-async function fetchOpenApiCandidate(candidate: OpenApiCandidate) {
+async function fetchOpenApiCandidate(
+	candidate: OpenApiCandidate,
+	options: OpenApiRequestOptions,
+) {
+	let url = httpsUrl(candidate.url)
+	if (!url) return undefined
+
+	for (
+		let redirectCount = 0;
+		redirectCount <= MAX_OPENAPI_REDIRECTS;
+		redirectCount += 1
+	) {
+		const response = await fetchOpenApiResponse(url)
+		if (!response) return undefined
+
+		if (isRedirectStatus(response.status)) {
+			if (redirectCount === MAX_OPENAPI_REDIRECTS) return undefined
+			const nextUrl = httpsRedirectUrl(response.headers.get("location"), url)
+			if (!nextUrl) return undefined
+			url = nextUrl
+			continue
+		}
+
+		if (response.status !== 200) return undefined
+
+		const contentType = response.headers.get("content-type") ?? "unknown"
+		const body = await readTextWithLimit(response, MAX_OPENAPI_FETCH_BYTES)
+		if (!body) return undefined
+
+		const document = parseOpenApiDocument(body.text)
+		if (!document) return undefined
+
+		return formatOpenApiDocument(
+			{
+				source: candidate.source,
+				url: url.toString(),
+				contentType,
+				bytes: body.bytes,
+				document,
+			},
+			options,
+		)
+	}
+
+	return undefined
+}
+
+async function fetchOpenApiResponse(url: URL): Promise<Response | undefined> {
 	const controller = new AbortController()
 	const timeout = setTimeout(() => controller.abort(), OPENAPI_FETCH_TIMEOUT_MS)
 	try {
-		const response = await fetch(candidate.url, {
-			headers: { accept: "application/json, application/yaml, text/yaml, */*" },
+		return await fetch(url.toString(), {
+			headers: { accept: "application/json, */*" },
+			redirect: "manual",
 			cf: { cacheTtl: 300 },
 			signal: controller.signal,
 		})
-		if (!response.ok) return undefined
-
-		const contentType = response.headers.get("content-type") ?? "unknown"
-		const text = await response.text()
-		return {
-			source: candidate.source,
-			url: candidate.url,
-			contentType,
-			document: parseJsonIfPossible(text),
-		}
 	} catch {
 		return undefined
 	} finally {
 		clearTimeout(timeout)
 	}
+}
+
+function formatOpenApiDocument(
+	fetched: FetchedOpenApi,
+	options: OpenApiRequestOptions,
+) {
+	if (options.raw && fetched.bytes <= MAX_OPENAPI_RAW_BYTES) {
+		return {
+			source: fetched.source,
+			url: fetched.url,
+			sourceUrl: fetched.url,
+			contentType: fetched.contentType,
+			bytes: fetched.bytes,
+			raw: true,
+			summary: false,
+			document: fetched.document,
+		}
+	}
+
+	return {
+		source: fetched.source,
+		url: fetched.url,
+		sourceUrl: fetched.url,
+		contentType: fetched.contentType,
+		bytes: fetched.bytes,
+		raw: false,
+		summary: true,
+		...summarizeOpenApiDocument(fetched.document),
+		...(options.raw && fetched.bytes > MAX_OPENAPI_RAW_BYTES
+			? {
+					note: `Raw OpenAPI document is ${fetched.bytes} bytes, above the ${MAX_OPENAPI_RAW_BYTES} byte cap; returning summary instead.`,
+				}
+			: {}),
+	}
+}
+
+function summarizeOpenApiDocument(document: OpenApiDocument) {
+	return {
+		...(typeof document.openapi === "string"
+			? { openapiVersion: document.openapi }
+			: {}),
+		info: openApiInfo(document.info),
+		...(document["x-service-info"] !== undefined
+			? { "x-service-info": document["x-service-info"] }
+			: {}),
+		paths: summarizeOpenApiPaths(document.paths),
+	}
+}
+
+function openApiInfo(value: unknown) {
+	if (!isRecord(value)) return {}
+	return {
+		...(typeof value.title === "string" ? { title: value.title } : {}),
+		...(typeof value.version === "string" ? { version: value.version } : {}),
+	}
+}
+
+function summarizeOpenApiPaths(paths: unknown) {
+	if (!isRecord(paths)) return []
+
+	const summaries: Array<Record<string, unknown>> = []
+	for (const [path, pathItem] of Object.entries(paths)) {
+		if (!isRecord(pathItem)) continue
+		for (const method of HTTP_METHODS) {
+			const operation = pathItem[method]
+			if (!isRecord(operation)) continue
+			const summary =
+				typeof operation.summary === "string"
+					? operation.summary
+					: typeof operation.description === "string"
+						? operation.description
+						: undefined
+			const offers = operation["x-payment-info"] ?? pathItem["x-payment-info"]
+			summaries.push({
+				method: method.toUpperCase(),
+				path,
+				...(summary ? { summary } : {}),
+				...(offers !== undefined ? { offers } : {}),
+			})
+		}
+	}
+	return summaries
+}
+
+async function readTextWithLimit(
+	response: Response,
+	maxBytes: number,
+): Promise<{ text: string; bytes: number } | undefined> {
+	const contentLength = response.headers.get("content-length")
+	if (contentLength) {
+		const parsedLength = Number(contentLength)
+		if (Number.isFinite(parsedLength) && parsedLength > maxBytes) {
+			return undefined
+		}
+	}
+
+	const reader = response.body?.getReader()
+	if (!reader) {
+		const text = await response.text()
+		const bytes = utf8Bytes(text)
+		return bytes <= maxBytes ? { text, bytes } : undefined
+	}
+
+	const decoder = new TextDecoder()
+	const chunks: string[] = []
+	let bytes = 0
+	while (true) {
+		const { done, value } = await reader.read()
+		if (done) break
+		bytes += value.byteLength
+		if (bytes > maxBytes) {
+			await reader.cancel()
+			return undefined
+		}
+		chunks.push(decoder.decode(value, { stream: true }))
+	}
+	chunks.push(decoder.decode())
+	return { text: chunks.join(""), bytes }
+}
+
+function parseOpenApiDocument(text: string): OpenApiDocument | undefined {
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(text)
+	} catch {
+		return undefined
+	}
+	if (!isRecord(parsed)) return undefined
+	if (typeof parsed.openapi === "string" || isRecord(parsed.paths)) {
+		return parsed as OpenApiDocument
+	}
+	return undefined
+}
+
+function httpsUrl(value: string): URL | undefined {
+	try {
+		const url = new URL(value)
+		return url.protocol === "https:" ? url : undefined
+	} catch {
+		return undefined
+	}
+}
+
+function httpsRedirectUrl(location: string | null, baseUrl: URL): URL | undefined {
+	if (!location) return undefined
+	try {
+		const url = new URL(location, baseUrl)
+		return url.protocol === "https:" ? url : undefined
+	} catch {
+		return undefined
+	}
+}
+
+function isRedirectStatus(status: number): boolean {
+	return [301, 302, 303, 307, 308].includes(status)
+}
+
+function utf8Bytes(value: string): number {
+	return new TextEncoder().encode(value).byteLength
+}
+
+function isRecord(value: unknown): value is JsonObject {
+	return typeof value === "object" && value !== null && !Array.isArray(value)
 }
 
 function initializeResult(params: unknown) {
@@ -450,12 +682,17 @@ function toolSchemas() {
 		{
 			name: "get_openapi",
 			description:
-				"Fetch OpenAPI data using service.docs.openapi, service.url/openapi.json, service.docs.apiReference, then a registry-derived endpoint view." +
+				"Fetch and summarize OpenAPI data using service.docs.openapi, service.url/openapi.json, service.docs.apiReference, then a registry-derived endpoint view; set raw true for the full document when it is under the raw byte cap." +
 				advisory,
 			inputSchema: {
 				type: "object",
 				properties: {
 					service: { type: "string", description: "Service id or name." },
+					raw: {
+						type: "boolean",
+						default: false,
+						description: `Return the full fetched OpenAPI document when it is at or below ${MAX_OPENAPI_RAW_BYTES} bytes; larger documents return a summary with a note.`,
+					},
 				},
 				required: ["service"],
 				additionalProperties: false,
@@ -490,8 +727,6 @@ function paginatedServicesOutputSchema() {
 		properties: {
 			...commonEnvelopeProperties(),
 			appliedFilters: { type: "object", additionalProperties: true },
-			filters: { type: "object", additionalProperties: true },
-			count: { type: "integer", minimum: 0 },
 			total: { type: "integer", minimum: 0 },
 			returned: { type: "integer", minimum: 0 },
 			offset: { type: "integer", minimum: 0 },
@@ -508,7 +743,6 @@ function paginatedServicesOutputSchema() {
 			"fetchedAt",
 			"sourceUrl",
 			"appliedFilters",
-			"count",
 			"total",
 			"returned",
 			"offset",
@@ -585,6 +819,39 @@ function openApiOutputSchema() {
 			},
 			openapi: {
 				type: "object",
+				properties: {
+					source: {
+						type: "string",
+						enum: ["docs.openapi", "well-known", "apiReference", "registry"],
+					},
+					url: { type: "string" },
+					sourceUrl: { type: "string" },
+					contentType: { type: "string" },
+					bytes: { type: "integer", minimum: 0 },
+					raw: { type: "boolean" },
+					summary: { type: "boolean" },
+					openapiVersion: { type: "string" },
+					info: { type: "object", additionalProperties: true },
+					"x-service-info": {
+						additionalProperties: true,
+					},
+					paths: {
+						type: "array",
+						items: {
+							type: "object",
+							properties: {
+								method: { type: "string" },
+								path: { type: "string" },
+								summary: { type: "string" },
+								offers: {},
+							},
+							required: ["method", "path"],
+							additionalProperties: true,
+						},
+					},
+					document: { type: "object", additionalProperties: true },
+					note: { type: "string" },
+				},
 				additionalProperties: true,
 			},
 		},
@@ -725,6 +992,17 @@ function paginationArgs(args: Record<string, unknown>): Pagination {
 	}
 }
 
+function booleanArg(
+	args: Record<string, unknown>,
+	key: string,
+	defaultValue: boolean,
+): boolean {
+	if (!(key in args)) return defaultValue
+	const value = args[key]
+	if (typeof value !== "boolean") throw new Error(`${key} must be a boolean`)
+	return value
+}
+
 function paginate<T>(items: T[], pagination: Pagination): T[] {
 	return items.slice(pagination.offset, pagination.offset + pagination.limit)
 }
@@ -812,14 +1090,6 @@ function toolCallParams(value: unknown): ToolCallParams {
 		return value as ToolCallParams
 	}
 	return {}
-}
-
-function parseJsonIfPossible(text: string): unknown {
-	try {
-		return JSON.parse(text)
-	} catch {
-		return text
-	}
 }
 
 function asRequest(value: unknown): JsonRpcRequest | undefined {

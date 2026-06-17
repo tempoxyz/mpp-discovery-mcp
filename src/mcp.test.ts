@@ -78,6 +78,13 @@ describe("mcp handler", () => {
 				expect.objectContaining({ type: "object" }),
 			)
 		}
+		expect(tools.find((tool) => tool.name === "get_openapi")?.inputSchema).toEqual(
+			expect.objectContaining({
+				properties: expect.objectContaining({
+					raw: expect.objectContaining({ type: "boolean" }),
+				}),
+			}),
+		)
 	})
 
 	it("rejects invalid enum filters instead of silently dropping them", async () => {
@@ -101,13 +108,15 @@ describe("mcp handler", () => {
 		const listBody = await callTool("list_services", { limit: 2, offset: 1 })
 		expect(listBody.result.structuredContent).toEqual(
 			expect.objectContaining({
-				count: 3,
 				total: 3,
 				returned: 2,
 				offset: 1,
 				limit: 2,
 			}),
 		)
+		expect(listBody.result.structuredContent).not.toHaveProperty("count")
+		expect(listBody.result.structuredContent).not.toHaveProperty("filters")
+		expect(listBody.result.content[0]?.text).toContain("Returned 2 of 3")
 		expect(listBody.result.structuredContent.services.map(serviceId)).toEqual([
 			"anthropic",
 			"legacy",
@@ -121,22 +130,38 @@ describe("mcp handler", () => {
 		expect(searchBody.result.structuredContent).toEqual(
 			expect.objectContaining({
 				appliedFilters: { category: "ai", method: "tempo" },
-				count: 2,
 				total: 2,
 				returned: 1,
 			}),
 		)
+		expect(searchBody.result.structuredContent).not.toHaveProperty("count")
+		expect(searchBody.result.structuredContent).not.toHaveProperty("filters")
+		expect(searchBody.result.content[0]?.text).toContain("Returned 1 of 2")
 		expect(searchBody.result.structuredContent.services.map(serviceId)).toEqual([
 			"agentmail",
 		])
 	})
 
-	it("resolves get_openapi through service.url/openapi.json when docs.openapi is absent", async () => {
+	it("returns a summary by default from a valid OpenAPI candidate", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async (input: RequestInfo | URL) => {
 				expect(String(input)).toBe("https://mpp.api.agentmail.to/openapi.json")
-				return Response.json({ openapi: "3.1.0", info: { title: "AgentMail" } })
+				return Response.json(
+					openApiDocument({
+						paths: {
+							"/v0/inboxes": {
+								get: { description: "List inboxes" },
+								post: {
+									summary: "Create inbox",
+									"x-payment-info": {
+										offers: [{ method: "tempo", amount: "2000000" }],
+									},
+								},
+							},
+						},
+					}),
+				)
 			}),
 		)
 
@@ -147,10 +172,154 @@ describe("mcp handler", () => {
 				openapi: expect.objectContaining({
 					source: "well-known",
 					url: "https://mpp.api.agentmail.to/openapi.json",
-					document: expect.objectContaining({ openapi: "3.1.0" }),
+					raw: false,
+					summary: true,
+					openapiVersion: "3.1.0",
+					info: { title: "AgentMail", version: "1.0.0" },
+					"x-service-info": { name: "AgentMail" },
+					paths: expect.arrayContaining([
+						{
+							method: "GET",
+							path: "/v0/inboxes",
+							summary: "List inboxes",
+						},
+						{
+							method: "POST",
+							path: "/v0/inboxes",
+							summary: "Create inbox",
+							offers: {
+								offers: [{ method: "tempo", amount: "2000000" }],
+							},
+						},
+					]),
 				}),
 			}),
 		)
+		expect(body.result.structuredContent.openapi).not.toHaveProperty("document")
+	})
+
+	it("returns the raw OpenAPI document when requested and under the cap", async () => {
+		const document = openApiDocument()
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL) => {
+				expect(String(input)).toBe("https://example.com/openapi.json")
+				return Response.json(document)
+			}),
+		)
+
+		const body = await callTool("get_openapi", {
+			service: "anthropic",
+			raw: true,
+		})
+		expect(body.result.structuredContent.openapi).toEqual(
+			expect.objectContaining({
+				source: "docs.openapi",
+				raw: true,
+				summary: false,
+				document,
+			}),
+		)
+	})
+
+	it("returns a summary with a note when raw OpenAPI exceeds the cap", async () => {
+		const document = openApiDocument({
+			paths: {
+				"/large": {
+					get: {
+						summary: "Large operation",
+						description: "x".repeat(270 * 1024),
+					},
+				},
+			},
+		})
+		const bodyText = JSON.stringify(document)
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				new Response(bodyText, {
+					headers: {
+						"content-type": "application/json",
+						"content-length": String(bodyText.length),
+					},
+				}),
+			),
+		)
+
+		const body = await callTool("get_openapi", {
+			service: "anthropic",
+			raw: true,
+		})
+		expect(body.result.structuredContent.openapi).toEqual(
+			expect.objectContaining({
+				source: "docs.openapi",
+				raw: false,
+				summary: true,
+				note: expect.stringContaining("returning summary"),
+				paths: [{ method: "GET", path: "/large", summary: "Large operation" }],
+			}),
+		)
+		expect(body.result.structuredContent.openapi).not.toHaveProperty("document")
+	})
+
+	it("rejects HTML and non-OpenAPI JSON candidates before registry fallback", async () => {
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			if (String(input) === "https://example.com/openapi.json") {
+				return Response.json({ ok: true })
+			}
+			if (String(input) === "https://api.anthropic.com/openapi.json") {
+				return new Response("<html>not an OpenAPI document</html>", {
+					status: 200,
+					headers: { "content-type": "text/html" },
+				})
+			}
+			throw new Error(`Unexpected fetch ${String(input)}`)
+		})
+		vi.stubGlobal("fetch", fetchMock)
+
+		const body = await callTool("get_openapi", { service: "anthropic" })
+		expect(fetchMock).toHaveBeenCalledTimes(2)
+		expect(body.result.structuredContent).toEqual(
+			expect.objectContaining({
+				source: "registry",
+				openapi: expect.objectContaining({
+					source: "registry",
+					endpoints: expect.arrayContaining([
+						expect.objectContaining({ path: "/v1/messages" }),
+					]),
+				}),
+			}),
+		)
+	})
+
+	it("rejects non-HTTPS candidates and over-long redirect chains", async () => {
+		const fetchMock = vi.fn(async () =>
+			new Response(null, {
+				status: 302,
+				headers: { location: "/next-openapi.json" },
+			}),
+		)
+		vi.stubGlobal("fetch", fetchMock)
+
+		const body = await mcp(
+			"tools/call",
+			{ name: "get_openapi", arguments: { service: "http-only" } },
+			envWithCatalogFor([
+				{
+					...services[0],
+					id: "http-only",
+					name: "HTTP Only",
+					url: "http://example.com",
+					docs: { openapi: "http://example.com/openapi.json" },
+				},
+			]),
+		)
+		expect(fetchMock).not.toHaveBeenCalledWith("http://example.com/openapi.json")
+		expect(body.result.structuredContent.source).toBe("registry")
+
+		const redirectBody = await callTool("get_openapi", { service: "agentmail" })
+		expect(fetchMock).toHaveBeenCalledTimes(4)
+		expect(redirectBody.result.structuredContent.source).toBe("registry")
 	})
 
 	it("falls back to the registry view when OpenAPI fetch candidates fail", async () => {
@@ -202,7 +371,12 @@ async function mcp(
 	)
 	return response.json() as Promise<{
 		result: {
-			tools?: Array<{ outputSchema?: unknown }>
+			tools?: Array<{
+				name?: string
+				inputSchema?: unknown
+				outputSchema?: unknown
+			}>
+			content: Array<{ type: string; text: string }>
 			isError?: boolean
 			structuredContent: {
 				count?: number
@@ -219,9 +393,13 @@ async function mcp(
 }
 
 function envWithCatalog(): Env {
+	return envWithCatalogFor(services)
+}
+
+function envWithCatalogFor(catalogServices: Service[]): Env {
 	const catalog: CachedCatalog = {
 		version: 1,
-		services,
+		services: catalogServices,
 		fetchedAt: new Date().toISOString(),
 		sourceUrl: "https://mpp.dev/api/services",
 	}
@@ -234,6 +412,20 @@ function envWithCatalog(): Env {
 			async put() {},
 		} as unknown as KVNamespace,
 	} as Env
+}
+
+function openApiDocument(overrides: Record<string, unknown> = {}) {
+	return {
+		openapi: "3.1.0",
+		info: { title: "AgentMail", version: "1.0.0" },
+		"x-service-info": { name: "AgentMail" },
+		paths: {
+			"/v0/inboxes": {
+				post: { summary: "Create inbox" },
+			},
+		},
+		...overrides,
+	}
 }
 
 function testContext(): ExecutionContext {
