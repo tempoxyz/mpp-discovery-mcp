@@ -1,0 +1,21 @@
+{
+	"name": "mpp-discovery-mcp",
+	"version": "1.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "wrangler dev --port 8787",
+		"deploy": "wrangler deploy",
+		"gen:types": "wrangler types",
+		"check:types": "tsc --noEmit",
+		"test": "vitest --run",
+		"check": "pnpm gen:types && pnpm check:types && pnpm test"
+	},
+	"packageManager": "pnpm@10.33.0",
+	"devDependencies": {
+		"@types/node": "^25.9.3",
+		"typescript": "^5.9.3",
+		"vitest": "^4.0.15",
+		"wrangler": "^4.101.0"
+	}
+}

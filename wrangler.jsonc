@@ -1,0 +1,32 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "mpp-discovery-mcp",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-06-16",
+	"compatibility_flags": ["nodejs_compat"],
+	"account_id": "0a39052b0a32ba8c8444345fe21b7595",
+	"workers_dev": true,
+	"preview_urls": true,
+	"keep_vars": true,
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1,
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 1,
+			"invocation_logs": true
+		}
+	},
+	"triggers": {
+		"crons": ["0 * * * *"]
+	},
+	"kv_namespaces": [
+		{
+			"binding": "MPP_CATALOG_CACHE",
+			"id": "27eb8359550f4bfca640ba87a0e37789"
+		}
+	],
+	"vars": {
+		"MPP_SERVICES_URL": "https://mpp.dev/api/services"
+	}
+}
