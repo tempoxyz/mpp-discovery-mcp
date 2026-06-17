@@ -13,6 +13,9 @@ const PROTOCOL_VERSION = "2025-06-18"
 const SERVER_VERSION = "1.0.0"
 const ADVISORY =
 	"Discovery is advisory; the runtime 402 Challenge is authoritative."
+const DEFAULT_LIMIT = 50
+const MAX_LIMIT = 200
+const OPENAPI_FETCH_TIMEOUT_MS = 3000
 
 const INITIALIZE_INSTRUCTIONS = [
 	"Use this read-only MCP server to discover MPP paid API services and payment terms from https://mpp.dev/api/services.",
@@ -38,6 +41,18 @@ type ToolCallParams = {
 type JsonRpcResponsePayload =
 	| { jsonrpc: "2.0"; id: JsonRpcId; result: unknown }
 	| { jsonrpc: "2.0"; id: JsonRpcId; error: { code: number; message: string } }
+
+type Pagination = {
+	limit: number
+	offset: number
+}
+
+type OpenApiSource = "docs.openapi" | "well-known" | "apiReference" | "registry"
+
+type OpenApiCandidate = {
+	source: Exclude<OpenApiSource, "registry">
+	url: string
+}
 
 export async function handleMcp(
 	request: Request,
@@ -74,7 +89,7 @@ export function serverCard(origin: string) {
 		serverInfo: serverInfo(),
 		description:
 			"Read-only MCP server exposing the MPP service discovery catalog and payment terms as advisory MCP tools.",
-		documentationUrl: "https://mpp.dev/",
+		documentationUrl: "https://mpp.dev/advanced/discovery",
 		iconUrl: "https://mpp.dev/favicon.svg",
 		transport: {
 			type: "streamable-http",
@@ -166,43 +181,69 @@ async function handleToolCall(
 		}
 
 		if (name === "list_services") {
+			const pagination = paginationArgs(args)
 			const services = listServiceSummaries(catalog.services)
+			const page = paginate(services, pagination)
 			return toolResult(
-				{ ...meta, count: services.length, services },
-				`Returned ${services.length} MPP services. ${ADVISORY}`,
+				{
+					...meta,
+					appliedFilters: {},
+					count: services.length,
+					total: services.length,
+					returned: page.length,
+					offset: pagination.offset,
+					limit: pagination.limit,
+					services: page,
+				},
+				`Returned ${page.length} of ${services.length} MPP services. ${ADVISORY}`,
 			)
 		}
 
 		if (name === "search_services") {
 			const filters = searchArgs(args)
+			const pagination = paginationArgs(args)
 			const services = searchServices(catalog.services, filters)
+			const page = paginate(services, pagination)
 			return toolResult(
-				{ ...meta, filters, count: services.length, services },
-				`Matched ${services.length} MPP services. ${ADVISORY}`,
+				{
+					...meta,
+					appliedFilters: filters,
+					filters,
+					count: services.length,
+					total: services.length,
+					returned: page.length,
+					offset: pagination.offset,
+					limit: pagination.limit,
+					services: page,
+				},
+				`Matched ${services.length} MPP services; returned ${page.length}. ${ADVISORY}`,
 			)
 		}
 
 		if (name === "get_service") {
+			const idOrName = requiredString(args, "id_or_name")
 			const service = requireService(
 				catalog.services,
-				requiredString(args, "id_or_name"),
+				idOrName,
 			)
 			return toolResult(
-				{ ...meta, service },
+				{ ...meta, appliedFilters: { id_or_name: idOrName }, count: 1, service },
 				`Returned service ${service.id}. ${ADVISORY}`,
 			)
 		}
 
 		if (name === "get_offers") {
+			const serviceName = requiredString(args, "service")
 			const service = requireService(
 				catalog.services,
-				requiredString(args, "service"),
+				serviceName,
 			)
 			const route = optionalString(args, "route")
 			const offers = offersForService(service, route)
 			return toolResult(
 				{
 					...meta,
+					appliedFilters: { service: serviceName, ...(route ? { route } : {}) },
 					service: serviceRef(service),
 					...(route ? { route } : {}),
 					count: offers.length,
@@ -213,14 +254,22 @@ async function handleToolCall(
 		}
 
 		if (name === "get_openapi") {
+			const serviceName = requiredString(args, "service")
 			const service = requireService(
 				catalog.services,
-				requiredString(args, "service"),
+				serviceName,
 			)
 			const openapi = await openApiFor(service)
 			return toolResult(
-				{ ...meta, service: serviceRef(service), openapi },
-				`${openapi.source === "openapi" ? "Fetched OpenAPI" : "Returned registry endpoint view"} for ${service.id}. ${ADVISORY}`,
+				{
+					...meta,
+					appliedFilters: { service: serviceName },
+					service: serviceRef(service),
+					count: 1,
+					source: openapi.source,
+					openapi,
+				},
+				`${openapi.source === "registry" ? "Returned registry endpoint view" : `Fetched ${openapi.source} OpenAPI candidate`} for ${service.id}. ${ADVISORY}`,
 			)
 		}
 
@@ -231,24 +280,53 @@ async function handleToolCall(
 }
 
 async function openApiFor(service: Service) {
-	const openapiUrl = service.docs?.openapi
-	if (!openapiUrl) return registryOpenApiView(service)
-
-	const response = await fetch(openapiUrl, {
-		headers: { accept: "application/json, application/yaml, text/yaml, */*" },
-		cf: { cacheTtl: 300 },
-	})
-	if (!response.ok) {
-		throw new Error(`OpenAPI fetch failed for ${service.id}: ${response.status}`)
+	for (const candidate of openApiCandidates(service)) {
+		const fetched = await fetchOpenApiCandidate(candidate)
+		if (fetched) return fetched
 	}
 
-	const contentType = response.headers.get("content-type") ?? "unknown"
-	const text = await response.text()
-	return {
-		source: "openapi",
-		openapiUrl,
-		contentType,
-		document: parseJsonIfPossible(text),
+	return registryOpenApiView(service)
+}
+
+function openApiCandidates(service: Service): OpenApiCandidate[] {
+	return [
+		...(service.docs?.openapi
+			? [{ source: "docs.openapi" as const, url: service.docs.openapi }]
+			: []),
+		{ source: "well-known" as const, url: openApiConventionUrl(service.url) },
+		...(service.docs?.apiReference
+			? [{ source: "apiReference" as const, url: service.docs.apiReference }]
+			: []),
+	]
+}
+
+function openApiConventionUrl(serviceUrl: string): string {
+	return `${serviceUrl.replace(/\/+$/, "")}/openapi.json`
+}
+
+async function fetchOpenApiCandidate(candidate: OpenApiCandidate) {
+	const controller = new AbortController()
+	const timeout = setTimeout(() => controller.abort(), OPENAPI_FETCH_TIMEOUT_MS)
+	try {
+		const response = await fetch(candidate.url, {
+			headers: { accept: "application/json, application/yaml, text/yaml, */*" },
+			cf: { cacheTtl: 300 },
+			signal: controller.signal,
+		})
+		if (!response.ok) return undefined
+
+		const contentType = response.headers.get("content-type") ?? "unknown"
+		const text = await response.text()
+		return {
+			source: candidate.source,
+			url: candidate.url,
+			contentType,
+			document: parseJsonIfPossible(text),
+		}
+	} catch {
+		return undefined
+	} finally {
+		clearTimeout(timeout)
 	}
 }
 
@@ -291,9 +369,10 @@ function toolSchemas() {
 				advisory,
 			inputSchema: {
 				type: "object",
-				properties: {},
+				properties: paginationInputProperties(),
 				additionalProperties: false,
 			},
+			outputSchema: paginatedServicesOutputSchema(),
 			execution: { taskSupport: "forbidden" },
 		},
 		{
@@ -324,9 +403,11 @@ function toolSchemas() {
 						enum: STATUSES,
 						description: "Exact status filter.",
 					},
+					...paginationInputProperties(),
 				},
 				additionalProperties: false,
 			},
+			outputSchema: paginatedServicesOutputSchema(),
 			execution: { taskSupport: "forbidden" },
 		},
 		{
@@ -343,6 +424,7 @@ function toolSchemas() {
 				required: ["id_or_name"],
 				additionalProperties: false,
 			},
+			outputSchema: serviceOutputSchema(),
 			execution: { taskSupport: "forbidden" },
 		},
 		{
@@ -362,12 +444,13 @@ function toolSchemas() {
 				required: ["service"],
 				additionalProperties: false,
 			},
+			outputSchema: offersOutputSchema(),
 			execution: { taskSupport: "forbidden" },
 		},
 		{
 			name: "get_openapi",
 			description:
-				"Fetch service.docs.openapi live when present; otherwise return a registry-derived endpoint view." +
+				"Fetch OpenAPI data using service.docs.openapi, service.url/openapi.json, service.docs.apiReference, then a registry-derived endpoint view." +
 				advisory,
 			inputSchema: {
 				type: "object",
@@ -377,9 +460,231 @@ function toolSchemas() {
 				required: ["service"],
 				additionalProperties: false,
 			},
+			outputSchema: openApiOutputSchema(),
 			execution: { taskSupport: "forbidden" },
 		},
 	] as const
+}
+
+function paginationInputProperties() {
+	return {
+		limit: {
+			type: "integer",
+			minimum: 1,
+			maximum: MAX_LIMIT,
+			default: DEFAULT_LIMIT,
+			description: `Maximum number of services to return, up to ${MAX_LIMIT}.`,
+		},
+		offset: {
+			type: "integer",
+			minimum: 0,
+			default: 0,
+			description: "Number of matching services to skip before returning results.",
+		},
+	}
+}
+
+function paginatedServicesOutputSchema() {
+	return oneOfSuccessOrError({
+		type: "object",
+		properties: {
+			...commonEnvelopeProperties(),
+			appliedFilters: { type: "object", additionalProperties: true },
+			filters: { type: "object", additionalProperties: true },
+			count: { type: "integer", minimum: 0 },
+			total: { type: "integer", minimum: 0 },
+			returned: { type: "integer", minimum: 0 },
+			offset: { type: "integer", minimum: 0 },
+			limit: { type: "integer", minimum: 1, maximum: MAX_LIMIT },
+			services: {
+				type: "array",
+				items: serviceSummarySchema(),
+			},
+		},
+		required: [
+			"advisory",
+			"catalogVersion",
+			"cacheStatus",
+			"fetchedAt",
+			"sourceUrl",
+			"appliedFilters",
+			"count",
+			"total",
+			"returned",
+			"offset",
+			"limit",
+			"services",
+		],
+		additionalProperties: false,
+	})
+}
+
+function serviceOutputSchema() {
+	return oneOfSuccessOrError({
+		type: "object",
+		properties: {
+			...commonEnvelopeProperties(),
+			appliedFilters: { type: "object", additionalProperties: true },
+			count: { type: "integer", const: 1 },
+			service: serviceSchema(),
+		},
+		required: [
+			"advisory",
+			"catalogVersion",
+			"cacheStatus",
+			"fetchedAt",
+			"sourceUrl",
+			"appliedFilters",
+			"count",
+			"service",
+		],
+		additionalProperties: false,
+	})
+}
+
+function offersOutputSchema() {
+	return oneOfSuccessOrError({
+		type: "object",
+		properties: {
+			...commonEnvelopeProperties(),
+			appliedFilters: { type: "object", additionalProperties: true },
+			service: serviceRefSchema(),
+			route: { type: "string" },
+			count: { type: "integer", minimum: 0 },
+			offers: {
+				type: "array",
+				items: offerSchema(),
+			},
+		},
+		required: [
+			"advisory",
+			"catalogVersion",
+			"cacheStatus",
+			"fetchedAt",
+			"sourceUrl",
+			"appliedFilters",
+			"service",
+			"count",
+			"offers",
+		],
+		additionalProperties: false,
+	})
+}
+
+function openApiOutputSchema() {
+	return oneOfSuccessOrError({
+		type: "object",
+		properties: {
+			...commonEnvelopeProperties(),
+			appliedFilters: { type: "object", additionalProperties: true },
+			service: serviceRefSchema(),
+			count: { type: "integer", const: 1 },
+			source: {
+				type: "string",
+				enum: ["docs.openapi", "well-known", "apiReference", "registry"],
+			},
+			openapi: {
+				type: "object",
+				additionalProperties: true,
+			},
+		},
+		required: [
+			"advisory",
+			"catalogVersion",
+			"cacheStatus",
+			"fetchedAt",
+			"sourceUrl",
+			"appliedFilters",
+			"service",
+			"count",
+			"source",
+			"openapi",
+		],
+		additionalProperties: false,
+	})
+}
+
+function commonEnvelopeProperties() {
+	return {
+		advisory: { type: "string", const: ADVISORY },
+		catalogVersion: { type: "integer" },
+		cacheStatus: { type: "string", enum: ["fresh", "stale", "refreshed"] },
+		fetchedAt: { type: "string" },
+		sourceUrl: { type: "string" },
+	}
+}
+
+function serviceSummarySchema() {
+	return {
+		type: "object",
+		properties: {
+			id: { type: "string" },
+			name: { type: "string" },
+			url: { type: "string" },
+			categories: { type: "array", items: { type: "string", enum: CATEGORIES } },
+			integration: { type: "string", enum: INTEGRATIONS },
+			status: { type: "string", enum: STATUSES },
+			description: { type: "string" },
+		},
+		required: ["id", "name", "url", "categories", "status"],
+		additionalProperties: false,
+	}
+}
+
+function serviceSchema() {
+	return {
+		type: "object",
+		required: ["id", "name", "url", "methods", "endpoints"],
+		additionalProperties: true,
+	}
+}
+
+function serviceRefSchema() {
+	return {
+		type: "object",
+		properties: {
+			id: { type: "string" },
+			name: { type: "string" },
+			url: { type: "string" },
+			serviceUrl: { type: "string" },
+		},
+		required: ["id", "name", "url"],
+		additionalProperties: false,
+	}
+}
+
+function offerSchema() {
+	return {
+		type: "object",
+		properties: {
+			method: { type: "string" },
+			path: { type: "string" },
+			description: { type: "string" },
+			docs: { type: "string" },
+			payment: { type: "object", additionalProperties: true },
+		},
+		required: ["method", "path", "payment"],
+		additionalProperties: false,
+	}
+}
+
+function oneOfSuccessOrError(successSchema: Record<string, unknown>) {
+	return {
+		type: "object",
+		oneOf: [
+			successSchema,
+			{
+				type: "object",
+				properties: {
+					success: { type: "boolean", const: false },
+					error: { type: "string" },
+					advisory: { type: "string", const: ADVISORY },
+				},
+				required: ["success", "error", "advisory"],
+				additionalProperties: false,
+			},
+		],
+	}
 }
 
 function toolResult(structuredContent: unknown, text: string) {
@@ -391,22 +696,37 @@ function toolResult(structuredContent: unknown, text: string) {
 
 function toolError(message: string) {
 	return {
-		content: [{ type: "text", text: message }],
-		structuredContent: { success: false, error: message },
+		content: [{ type: "text", text: `${message}. ${ADVISORY}` }],
+		structuredContent: { success: false, error: message, advisory: ADVISORY },
 		isError: true,
 	}
 }
 
 function searchArgs(args: Record<string, unknown>): SearchServicesArgs {
+	const query = optionalString(args, "query")
+	const method = optionalString(args, "method")
+	const category = optionalEnumArg(args, "category", CATEGORIES)
+	const integration = optionalEnumArg(args, "integration", INTEGRATIONS)
+	const status = optionalEnumArg(args, "status", STATUSES)
+
 	return {
-		...(optionalString(args, "query") ? { query: optionalString(args, "query") } : {}),
-		...(enumValue(CATEGORIES, args.category) ? { category: enumValue(CATEGORIES, args.category) } : {}),
-		...(optionalString(args, "method") ? { method: optionalString(args, "method") } : {}),
-		...(enumValue(INTEGRATIONS, args.integration)
-			? { integration: enumValue(INTEGRATIONS, args.integration) }
-			: {}),
-		...(enumValue(STATUSES, args.status) ? { status: enumValue(STATUSES, args.status) } : {}),
+		...(query ? { query } : {}),
+		...(category ? { category } : {}),
+		...(method ? { method } : {}),
+		...(integration ? { integration } : {}),
+		...(status ? { status } : {}),
 	}
+}
+
+function paginationArgs(args: Record<string, unknown>): Pagination {
+	return {
+		limit: integerArg(args, "limit", DEFAULT_LIMIT, 1, MAX_LIMIT),
+		offset: integerArg(args, "offset", 0, 0),
+	}
+}
+
+function paginate<T>(items: T[], pagination: Pagination): T[] {
+	return items.slice(pagination.offset, pagination.offset + pagination.limit)
 }
 
 function requireService(services: Service[], idOrName: string): Service {
@@ -440,13 +760,44 @@ function optionalString(
 	return trimmed || undefined
 }
 
-function enumValue<const T extends readonly string[]>(
+function optionalEnumArg<const T extends readonly string[]>(
+	args: Record<string, unknown>,
+	key: string,
 	values: T,
-	value: unknown,
 ): T[number] | undefined {
-	return typeof value === "string" && values.includes(value)
-		? (value as T[number])
-		: undefined
+	if (!(key in args)) return undefined
+	const value = args[key]
+	if (typeof value !== "string" || !values.includes(value)) {
+		throw new Error(
+			`Invalid ${key}: ${String(value)}. Allowed values: ${values.join(", ")}`,
+		)
+	}
+	return value as T[number]
+}
+
+function integerArg(
+	args: Record<string, unknown>,
+	key: string,
+	defaultValue: number,
+	minimum: number,
+	maximum = Number.MAX_SAFE_INTEGER,
+): number {
+	if (!(key in args)) return defaultValue
+	const value = args[key]
+	const parsed =
+		typeof value === "number"
+			? value
+			: typeof value === "string" && value.trim() !== ""
+				? Number(value)
+				: Number.NaN
+	if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+		const range =
+			maximum === Number.MAX_SAFE_INTEGER
+				? `at least ${minimum}`
+				: `between ${minimum} and ${maximum}`
+		throw new Error(`${key} must be an integer ${range}`)
+	}
+	return parsed
 }
 
 function objectArgs(value: unknown): Record<string, unknown> {
